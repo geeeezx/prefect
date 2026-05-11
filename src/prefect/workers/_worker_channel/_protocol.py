@@ -25,6 +25,7 @@ from prefect.client.schemas.worker_channel import (
     WorkerHelloFrame,
     WorkerReadyFrame,
     WorkPoolSnapshotFrame,
+    WorkPoolSnapshotPayload,
     validate_worker_channel_frame,
 )
 from prefect.settings import get_current_settings
@@ -34,6 +35,7 @@ from prefect.workers._worker_channel._state import (
     WorkerChannelError,
     WorkerChannelRetryableError,
     WorkerChannelTerminalError,
+    WorkPoolSnapshotState,
 )
 
 
@@ -70,6 +72,7 @@ class WorkerChannelProtocolHandler:
         self._on_work_pool_snapshot = on_work_pool_snapshot
         self._worker_id: UUID | None = None
         self._worker_metadata_sent = False
+        self._work_pool_snapshots = WorkPoolSnapshotState()
 
     @property
     def worker_id(self) -> UUID | None:
@@ -78,6 +81,10 @@ class WorkerChannelProtocolHandler:
     @property
     def worker_metadata_sent(self) -> bool:
         return self._worker_metadata_sent
+
+    @property
+    def work_pool_snapshots_available(self) -> bool:
+        return self._work_pool_snapshots.snapshots_available
 
     async def handshake(
         self, websocket: websockets.asyncio.client.ClientConnection
@@ -156,12 +163,26 @@ class WorkerChannelProtocolHandler:
             )
 
     def _handle_ready(self, ready: WorkerReadyFrame) -> None:
-        self.handle_work_pool_snapshot(ready.payload.initial_snapshot.work_pool)
+        self.reset_work_pool_snapshot_sequence()
+        self.handle_work_pool_snapshot(ready.payload.initial_snapshot)
         worker_id = ready.payload.worker_id
         if worker_id is not None:
             self.record_worker_id(worker_id)
 
-    def handle_work_pool_snapshot(self, work_pool: WorkPool) -> None:
+    def reset_work_pool_snapshot_sequence(self) -> None:
+        self._work_pool_snapshots.reset_connection_sequence()
+
+    def handle_work_pool_snapshot(self, snapshot: WorkPoolSnapshotPayload) -> bool:
+        work_pool = self._work_pool_snapshots.apply_snapshot(snapshot)
+        if work_pool is None:
+            return False
+
+        if self._on_work_pool_snapshot is not None:
+            self._on_work_pool_snapshot(work_pool)
+        return True
+
+    def record_rest_work_pool_snapshot(self, work_pool: WorkPool) -> None:
+        work_pool = self._work_pool_snapshots.replace_from_rest(work_pool)
         if self._on_work_pool_snapshot is not None:
             self._on_work_pool_snapshot(work_pool)
 
@@ -253,7 +274,7 @@ class WorkerChannelProtocolHandler:
                 ) from exc
 
             if isinstance(frame, WorkPoolSnapshotFrame):
-                self.handle_work_pool_snapshot(frame.payload.work_pool)
+                self.handle_work_pool_snapshot(frame.payload)
                 continue
 
             raise WorkerChannelTerminalError(
